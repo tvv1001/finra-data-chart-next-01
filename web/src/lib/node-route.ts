@@ -1,13 +1,41 @@
 const NODE_ROUTE_BASE = '/node';
 
-function toNodeRouteSlug(nodeId: string) {
+function canonicalizeRouteNodeId(nodeId: string) {
 	const normalizedNodeId = String(nodeId || '').trim();
 	if (!normalizedNodeId) return '';
-	const separatorIndex = normalizedNodeId.indexOf(':');
-	if (separatorIndex < 0) return encodeURIComponent(normalizedNodeId);
-	const prefix = normalizedNodeId.slice(0, separatorIndex).trim();
-	const rawSuffix = normalizedNodeId.slice(separatorIndex + 1).trim();
-	if (!prefix || !rawSuffix) return encodeURIComponent(normalizedNodeId);
+
+	const rawId = normalizedNodeId
+		.replace(/^finra:/i, '')
+		.replace(/^sec:/i, '')
+		.replace(/^individual:/i, 'person:')
+		.replace(/^person_/i, 'person:')
+		.replace(/^firm_/i, 'firm:');
+
+	if (/^person:/i.test(rawId)) {
+		return `person:${rawId.slice('person:'.length).trim()}`;
+	}
+	if (/^firm:/i.test(rawId)) {
+		return `firm:${rawId.slice('firm:'.length).trim()}`;
+	}
+
+	return normalizedNodeId;
+}
+
+function toNodeRouteSlug(nodeId: string) {
+	const canonicalNodeId = canonicalizeRouteNodeId(nodeId);
+	if (!canonicalNodeId) return '';
+
+	if (/^(person|firm):/i.test(canonicalNodeId)) {
+		const [kind, ...rest] = canonicalNodeId.split(':');
+		const value = rest.join(':').trim();
+		return value ? `${kind.toLowerCase()}-${value}` : kind.toLowerCase();
+	}
+
+	const separatorIndex = canonicalNodeId.indexOf(':');
+	if (separatorIndex < 0) return encodeURIComponent(canonicalNodeId);
+	const prefix = canonicalNodeId.slice(0, separatorIndex).trim();
+	const rawSuffix = canonicalNodeId.slice(separatorIndex + 1).trim();
+	if (!prefix || !rawSuffix) return encodeURIComponent(canonicalNodeId);
 	return `${encodeURIComponent(prefix)}-${encodeURIComponent(rawSuffix)}`;
 }
 
@@ -15,17 +43,30 @@ function fromNodeRouteSlug(slug: string) {
 	const normalizedSlug = String(slug || '').trim();
 	if (!normalizedSlug) return null;
 
+	const legacyParts = normalizedSlug.split('-');
+	if (legacyParts.length >= 3 && /^(finra|sec)$/i.test(legacyParts[0]) && /^(individual|person|firm)$/i.test(legacyParts[1])) {
+		const canonicalType = legacyParts[1] === 'individual' || legacyParts[1] === 'person' ? 'person' : 'firm';
+		const canonicalValue = legacyParts.slice(2).join('-');
+		if (canonicalValue) {
+			return canonicalizeRouteNodeId(`${canonicalType}:${canonicalValue}`);
+		}
+	}
+
+	const canonicalSlug = normalizedSlug.replace(/^person-/i, 'person:').replace(/^firm-/i, 'firm:');
+
 	try {
-		const legacyNodeId = decodeURIComponent(normalizedSlug);
-		if (legacyNodeId.includes(':')) return legacyNodeId;
+		const decodedSlug = decodeURIComponent(canonicalSlug);
+		if (decodedSlug.includes(':')) {
+			return canonicalizeRouteNodeId(decodedSlug);
+		}
 	} catch {}
 
 	const separatorIndex = normalizedSlug.indexOf('-');
 	if (separatorIndex < 0) {
 		try {
-			return decodeURIComponent(normalizedSlug);
+			return canonicalizeRouteNodeId(decodeURIComponent(normalizedSlug));
 		} catch {
-			return normalizedSlug;
+			return canonicalizeRouteNodeId(normalizedSlug);
 		}
 	}
 
@@ -33,16 +74,16 @@ function fromNodeRouteSlug(slug: string) {
 	const encodedSuffix = normalizedSlug.slice(separatorIndex + 1).trim();
 	if (!encodedPrefix || !encodedSuffix) {
 		try {
-			return decodeURIComponent(normalizedSlug);
+			return canonicalizeRouteNodeId(decodeURIComponent(normalizedSlug));
 		} catch {
-			return normalizedSlug;
+			return canonicalizeRouteNodeId(normalizedSlug);
 		}
 	}
 
 	try {
-		return `${decodeURIComponent(encodedPrefix)}:${decodeURIComponent(encodedSuffix)}`;
+		return canonicalizeRouteNodeId(`${decodeURIComponent(encodedPrefix)}:${decodeURIComponent(encodedSuffix)}`);
 	} catch {
-		return `${encodedPrefix}:${encodedSuffix}`;
+		return canonicalizeRouteNodeId(`${encodedPrefix}:${encodedSuffix}`);
 	}
 }
 

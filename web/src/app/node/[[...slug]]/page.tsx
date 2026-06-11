@@ -22,6 +22,6 @@ const GraphView = dynamic(() => import('@/components/GraphView'), {
 	),
 });
 
-export default function HomePage() {
+export default function NodePage() {
 	return <GraphView />;
 }

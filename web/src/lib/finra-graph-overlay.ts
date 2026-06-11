@@ -6,6 +6,7 @@
 
 import { DEFAULT_NODE_LABEL_FONT_SIZE, DEFAULT_NODE_LABEL_FONT_SIZE_PX, DEFAULT_NODE_LABEL_FONT_WEIGHT, DEFAULT_NODE_LABEL_GAP_PX } from './finra-graph-defaults';
 import { handleNodeOpen } from './finra-graph';
+import { buildNodeRoutePath } from './node-route';
 type Node = any;
 
 function getNodeVisualHalf(node: Node) {
@@ -291,6 +292,13 @@ function showTooltipForNode(node: any, anchorEl: HTMLElement, cache: Map<string,
 		});
 }
 
+function navigateToNodeRoute(nodeId: string | null | undefined) {
+	const nextPath = buildNodeRoutePath(nodeId ?? null);
+	if (!nextPath || nextPath === window.location.pathname) return;
+	window.history.replaceState({}, '', nextPath);
+	window.dispatchEvent(new PopStateEvent('popstate'));
+}
+
 function renderTooltipContent(tip: HTMLElement, nodeData: any) {
 	tip.innerHTML = '';
 	const title = document.createElement('div');
@@ -304,10 +312,15 @@ function renderTooltipContent(tip: HTMLElement, nodeData: any) {
 	meta.textContent = nodeData?.summary || nodeData?.subtitle || '';
 	tip.appendChild(meta);
 	const link = document.createElement('a');
-	link.href = `/node/${encodeURIComponent(String(nodeData?.id || ''))}`;
+	link.href = buildNodeRoutePath(nodeData?.id ?? null) || '#';
 	link.textContent = 'View profile';
 	link.style.display = 'block';
 	link.style.marginTop = '8px';
+	link.addEventListener('click', (event) => {
+		event.preventDefault();
+		event.stopPropagation();
+		navigateToNodeRoute(nodeData?.id ?? null);
+	});
 	tip.appendChild(link);
 }
 

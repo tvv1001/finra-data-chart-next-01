@@ -14,6 +14,8 @@ const RAW_DATA_DIR = path.join(__dirname, '../../../../../../data/raw');
 const STARTUP_SEED_PEOPLE_COUNT = 7;
 const STARTUP_SEED_FIRM_COUNT = 4;
 const DEFAULT_NAMESPACE = 'finra';
+const MAX_QUERY_MATCHES = 30;
+const MAX_VISIBLE_NODES_PER_QUERY = 120;
 
 type RawRecord = Record<string, unknown>;
 function asRecord(v: unknown): RawRecord {
@@ -359,7 +361,6 @@ function isSearchMatch(node: GraphNode, normalizedQuery: string): boolean {
 	return queryTokens.every((queryToken) => searchTokens.some((searchToken) => searchToken.includes(queryToken) || levenshteinDistance(searchToken, queryToken) <= threshold));
 }
 
-
 function getGraphData() {
 	if (!cache.graphData) {
 		cache.graphData = buildRawGraph();
@@ -456,18 +457,18 @@ export async function GET(request: Request) {
 		});
 	}
 	const matches = nodes.filter((node) => isSearchMatch(node, query)).sort((left, right) => scoreSearchMatch(left.searchText, query) - scoreSearchMatch(right.searchText, query));
-
-	const matchedNodeIds = matches.map((node) => node.id);
-	const primaryMatchId = matches[0]?.id ?? null;
+	const topMatches = matches.slice(0, MAX_QUERY_MATCHES);
+	const matchedNodeIds = topMatches.map((node) => node.id);
+	const primaryMatchId = topMatches[0]?.id ?? null;
 	const visibleNodeIds = new Set<string>();
 
-	for (const match of matches.slice(0, 20)) {
-		// Include the match itself
+	for (const match of topMatches) {
+		if (visibleNodeIds.size >= MAX_VISIBLE_NODES_PER_QUERY) break;
 		visibleNodeIds.add(match.id);
-		
-		// Always include direct neighbors for any match to reveal the cluster
+
 		const neighbors = adjacency.get(match.id) ?? new Set();
 		for (const neighborId of neighbors) {
+			if (visibleNodeIds.size >= MAX_VISIBLE_NODES_PER_QUERY) break;
 			visibleNodeIds.add(neighborId);
 		}
 	}
@@ -477,6 +478,11 @@ export async function GET(request: Request) {
 		.filter(Boolean) as GraphNode[];
 	const visibleLinks = links.filter((link) => visibleNodeIds.has(getEndpointId(link.source)) && visibleNodeIds.has(getEndpointId(link.target)));
 
+	const message =
+		matches.length === 0 ? `No matches found for "${query}".`
+		: matches.length > topMatches.length ? `Showing the top ${topMatches.length} matches for "${query}" (${visibleNodeIds.size} visible nodes / ${visibleLinks.length} links).`
+		: `Fetched ${visibleNodeIds.size} nodes for "${query}" with direct connections only.`;
+
 	return NextResponse.json({
 		query,
 		visibleNodeIds: Array.from(visibleNodeIds),
@@ -484,6 +490,6 @@ export async function GET(request: Request) {
 		visibleLinks,
 		matchedNodeIds,
 		primaryMatchId,
-		message: matches.length === 0 ? `No matches found for "${query}".` : `Fetched ${visibleNodeIds.size} nodes for "${query}" with direct connections only.`,
+		message,
 	});
 }

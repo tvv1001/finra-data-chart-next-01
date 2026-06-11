@@ -1,104 +1,21 @@
 ---
 name: FINRA SEC API Pattern Guidelines
-description: 'Imported planning guidance for a future FINRA/SEC data app. The local canonical data model and prod-only Redis cache stance are defined here, but this repo still has no FINRA routes or Redis implementation yet.'
-applyTo:
-  - '.github/finra-sec-api-patterns.instructions.md'
+description: "Use when editing FINRA BrokerCheck or SEC AdviserInfo API routes, crawler scripts, graph/sidebar code that links to upstream records, or docs/prompts that describe this app's external API patterns. Covers validated detail endpoints, search endpoints, placeholder usage, and cache naming."
 ---
+
+When working from `data/raw/` or the external imported raw set:
+
+- On VS Code / Copilot startup for this repository, first check for the latest external import at `../Data-finra-sec/data/raw/`.
+- If that external raw directory exists, prefer it as the freshest import source before relying on this repo's local `data/raw/`.
+- For data refresh, graph rebuild, primed bundle, search-index, or deploy-prep tasks, sync from that external raw directory into this repo's `data/raw/` first.
+- After syncing into `data/raw/`, rebuild the local derived artifacts needed to prep a Redis-backed deployment, including graph outputs and deployment bundle inputs.
+- Treat the imported raw directory as read-only; never edit it in place.
+- Prefer the imported raw files when validating upstream shape or history coverage, then update derived repo data separately.
+- For record inventory tasks, check both top-level individual and firm CRDs, and use `previousEmployments` / `previousIAEmployments` for individuals and `registrations` for firms.
+- When syncing or rebuilding derived caches, use append-safe logic that skips records already present instead of assuming a full rebuild.
+- If a task involves docs or prompts, describe the source as the latest source of truth and avoid implying that local derived caches are canonical.
 
 # FINRA / SEC API pattern guidelines
-
-## Status in `Cosmograph-fs`
-
-This file was imported from another application and is **not active architecture guidance for this repo yet**.
-
-Current verified state of `Cosmograph-fs`:
-
-- The app code lives under `web/`, not `src/` at the repo root.
-- There are currently **no** FINRA/SEC API routes in this repo.
-- There is currently **no** local FINRA entity store, crawler pipeline, or search index.
-- There is currently **no** Redis dependency, Redis client, or Redis environment configuration in this repo.
-- The current app is a client-rendered force-graph demo, not a FINRA-backed data application.
-
-Treat this file as a **planning note** rather than an instruction source for implementation work until the future FINRA/SEC app actually exists in this repo.
-
-## Chosen local canonical data structure
-
-When this repo grows into a FINRA/SEC data application, the local source of truth should be a **file-backed normalized dataset** stored with the web app, not Redis.
-
-Preferred location:
-
-- `web/data/finra/`
-
-Recommended structure:
-
-- `web/data/finra/entities/people/<CRD>.json`
-  - canonical person record keyed by CRD/source ID
-- `web/data/finra/entities/firms/<CRD>.json`
-  - canonical firm record keyed by CRD/source ID
-- `web/data/finra/relationships/<NODE_ID>.json`
-  - adjacency payload for a node, including connected people, firms, and link metadata
-- `web/data/finra/search/people-prefix/<TOKEN>.json`
-  - compact denormalized records for person search/typeahead
-- `web/data/finra/search/firms-prefix/<TOKEN>.json`
-  - compact denormalized records for firm search/typeahead
-- `web/data/finra/upstream-cache/<SOURCE>/<TYPE>_<ID>.json`
-  - optional raw upstream payload snapshots for refresh/debug workflows only
-
-When both FINRA and SEC details exist for the same CRD, the canonical record should be merged into a single entity node by CRD only when the entity type also matches (person/person or firm/firm). This means the final local entity file should preserve separate raw `finra` and `sec` payloads while also exposing one normalized `merged` view for the entity, but it must not collapse a person record into a firm record or vice versa.
-
-Canonical local records should be normalized enough to support:
-
-- entity lookup by CRD/source ID
-- graph expansion by node ID
-- one-word search/token lookup
-- sidebar summary and expanded detail views without depending on Redis
-
-Redis, if added later, should accelerate this local structure rather than replace it.
-
-## Future activation rule
-
-Only expand this document back into active repo guidance after all of the following are true:
-
-- the local data structure described below has been implemented in real code/data
-- real route or loader code exists for FINRA/SEC enrichment
-- the cache layer decision has been made and implemented
-- the `applyTo` paths have been rewritten to match the actual repo layout
-
-If that future version uses Redis, document Redis as a **cache layer**, not as the primary source of truth for graph entities.
-
-## Cache stance for now
-
-For this repo today, the correct statement is:
-
-- **Redis is not currently configured or required to launch the app.**
-- **If Redis is added later, it should exist only on the production server and must remain optional everywhere else.**
-
-Planned deployment stance:
-
-- local development: no Redis required
-- preview/test environments: should still boot without Redis unless explicitly enabled
-- production: Redis may be enabled as a cache layer only
-- cache miss behavior: fall back to the local canonical dataset or upstream fetch/hydration path
-- startup behavior: the app must not crash simply because Redis is absent
-
-If Redis is introduced later, document at minimum:
-
-- which package/client is used
-- required environment variables
-- key naming conventions
-- TTL policy
-- what data is cached versus persisted as canonical local data
-
-Recommended separation when that work begins:
-
-- canonical local data model: file-backed people, firms, relationships, and search-ready denormalized records under `web/data/finra/`
-- Redis cache: hydrated upstream responses, search result windows, and precomputed graph neighborhoods in production only
-
-The local data structure should be decided first; Redis should accelerate it, not define it.
-
----
-
-The remaining sections below are preserved from the source application for future reuse once this repo has matching functionality.
 
 This instruction supplements `.github/copilot-instructions.md` for work that touches upstream FINRA BrokerCheck and SEC AdviserInfo integrations.
 
@@ -156,6 +73,10 @@ Placeholder meanings:
 - `<R>`: upstream ranking/window parameter
 - `<FIRM_PREFIX>`: adviser firm-name prefix used by SEC individual search-by-firm flows
 
+## Merge rule for FINRA and SEC records
+
+When both FINRA and SEC detail files exist for the same CRD, merge them only when the entity type also matches (person/person or firm/firm). Do not merge a person CRD with a firm CRD, and do not collapse one entity type into the other.
+
 ## Keep route defaults aligned with the existing app
 
 When adding or editing route helpers, preserve the defaults already used by this app unless the task explicitly changes them:
@@ -210,11 +131,3 @@ This is especially important for:
 - selection and highlight behavior
 - sidebar and selection-log interactions
 - any statement about what colors, rings, or path overlays mean
-
-If the implementation and docs disagree, update the docs to match the verified current behavior unless the task explicitly requires changing the implementation too.
-
-## Good examples
-
-- Good: “Use `https://api.adviserinfo.sec.gov/search/firm/<CRD>?wt=json` for SEC firm detail hydration.”
-- Good: “Use `https://api.adviserinfo.sec.gov/search/firm?query=<QUERY>&hl=true&wt=json&nrows=<NROWS>&start=<START>` for firm search.”
-- Avoid: “Use `https://api.adviserinfo.sec.gov/search/firm/<CRD>?hl=true&nrows=12&query=smith&r=25&sort=score+desc&wt=json`” as a generic canonical example.

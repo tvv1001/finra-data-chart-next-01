@@ -35,6 +35,16 @@ const SIM_LINK_DISTANCE = 880;
 const SIM_CHARGE_STRENGTH = -720;
 const DRAG_CHILD_OFFSET_SCALE = 0.88;
 
+type WasmScriptLoaderState = { promise: Promise<void> | null; loaded: boolean };
+
+const wasmScriptLoader = (() => {
+	const scope = globalThis as typeof globalThis & { __graphWasmScriptLoader?: WasmScriptLoaderState };
+	if (!scope.__graphWasmScriptLoader) {
+		scope.__graphWasmScriptLoader = { promise: null, loaded: false };
+	}
+	return scope.__graphWasmScriptLoader;
+})();
+
 type InitialGraphState = {
 	dataset: GraphDataset;
 	visibleNodeIds: Set<string>;
@@ -130,7 +140,12 @@ export default function GraphView() {
 	const visibleGraph = useMemo(() => projectGraphData(dataset, visibleNodeIds), [dataset, visibleNodeIds]);
 	const activeNodeId = hoveredNodeId ?? selectedNodeId;
 	const activeNode = activeNodeId ? (dataset.nodeById.get(activeNodeId) ?? null) : null;
-	const displayedStats = useMemo(() => getDisplayedStats(visibleGraph), [visibleGraph]);
+	const displayedStats = useMemo(() => {
+		const visibleIds = new Set(visibleNodeIds);
+		const visibleNodes = dataset.graphData.nodes.filter((node) => visibleIds.has(node.id));
+		const visibleLinks = dataset.graphData.links.filter((link) => visibleIds.has(getEndpointId(link.source)) && visibleIds.has(getEndpointId(link.target)));
+		return getDisplayedStats({ nodes: visibleNodes, links: visibleLinks });
+	}, [dataset.graphData.links, dataset.graphData.nodes, visibleNodeIds]);
 
 	const highlightedNodeIds = useMemo(() => {
 		if (!activeNodeId) return new Set<string>();
@@ -217,19 +232,76 @@ export default function GraphView() {
 		fg.d3Force('collide', null);
 	}, [ForceGraph2D]);
 
-	// Load wasm_sim.js once on mount
+	// Load wasm_sim.js once per page session to avoid duplicate global bindings in dev mode.
 	useEffect(() => {
 		if (typeof window === 'undefined') return;
-		const script = document.createElement('script');
-		script.src = '/wasm-sim/wasm_sim.js';
-		script.onload = () => {
-			wasmLoadedRef.current = true;
-		};
-		document.head.appendChild(script);
-		return () => {
+
+		let cancelled = false;
+
+		const loadScript = async () => {
+			if (wasmScriptLoader.loaded) {
+				wasmLoadedRef.current = true;
+				return;
+			}
+
+			if (wasmScriptLoader.promise) {
+				await wasmScriptLoader.promise;
+				if (!cancelled) wasmLoadedRef.current = true;
+				return;
+			}
+
+			wasmScriptLoader.promise = new Promise<void>((resolve, reject) => {
+				const existing = document.querySelector<HTMLScriptElement>('script[src="/wasm-sim/wasm_sim.js"]');
+				if (existing) {
+					const existingReadyState = (existing as HTMLScriptElement & { readyState?: string }).readyState;
+					if (existing.dataset.loaded === 'true' || existingReadyState === 'complete') {
+						wasmLoadedRef.current = true;
+						wasmScriptLoader.loaded = true;
+						resolve();
+						return;
+					}
+					existing.addEventListener(
+						'load',
+						() => {
+							existing.dataset.loaded = 'true';
+							wasmLoadedRef.current = true;
+							resolve();
+						},
+						{ once: true },
+					);
+					existing.addEventListener('error', () => reject(new Error('Failed to load wasm_sim.js')), { once: true });
+					return;
+				}
+
+				const script = document.createElement('script');
+				script.src = '/wasm-sim/wasm_sim.js';
+				script.async = true;
+				script.onload = () => {
+					script.dataset.loaded = 'true';
+					wasmLoadedRef.current = true;
+					resolve();
+				};
+				script.onerror = () => reject(new Error('Failed to load wasm_sim.js'));
+				document.head.appendChild(script);
+			});
+
 			try {
-				document.head.removeChild(script);
-			} catch {}
+				await wasmScriptLoader.promise;
+				if (!cancelled) {
+					wasmScriptLoader.loaded = true;
+				}
+			} catch (error) {
+				wasmScriptLoader.promise = null;
+				throw error;
+			}
+		};
+
+		loadScript().catch((error) => {
+			console.error('Failed to load WASM simulator script:', error);
+		});
+
+		return () => {
+			cancelled = true;
 		};
 	}, []);
 
@@ -260,9 +332,11 @@ export default function GraphView() {
 					return globalScope.wasm_bindgen;
 				}
 			})();
-			if (!wbg) throw new Error('wasm_bindgen is not available');
-			const wasmModule =
-				typeof wbg === 'function' ? (await (wbg as (opts: { module_or_path: string }) => Promise<unknown>)({ module_or_path: '/wasm-sim/wasm_sim_bg.wasm' }), wbg) : wbg;
+			if (typeof wbg !== 'function') throw new Error('wasm_bindgen is not available');
+			const wasmInit = wbg as (opts: { module_or_path: string }) => Promise<unknown>;
+			await wasmInit({ module_or_path: '/wasm-sim/wasm_sim_bg.wasm' });
+			const wasmModule = wbg as unknown as WasmBindgenModule;
+			if (typeof wasmModule.GraphSimulation !== 'function') throw new Error('GraphSimulation is not available');
 			if (cancelled) return;
 
 			// Free the previous simulation
@@ -552,10 +626,17 @@ export default function GraphView() {
 			if (!query) return;
 			try {
 				clearSearchStreamTimers();
+				setStatusMessage(`Fetching matches for “${query}”…`);
 				const response = await fetch(`/api/graph/search?q=${encodeURIComponent(query)}`);
-				const result = (await response.json()) as { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[]; primaryMatchId?: string };
+				if (!response.ok) {
+					throw new Error(`Search request failed with status ${response.status}`);
+				}
+				const result = (await response.json()) as { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[]; primaryMatchId?: string; message?: string };
 				streamSearchResults(result, query);
-			} catch {}
+			} catch (error) {
+				console.error('Search request failed:', error);
+				setStatusMessage(error instanceof Error ? error.message : 'Search request failed.');
+			}
 		},
 		[clearSearchStreamTimers, searchQuery, streamSearchResults],
 	);

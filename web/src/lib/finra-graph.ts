@@ -364,6 +364,11 @@ function getCurrentGraphZoomScale() {
 	}
 }
 
+function shouldUseCanvasRenderer(nodeCount: number) {
+	const lowCoreCount = typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number' && navigator.hardwareConcurrency <= 4;
+	return nodeCount >= 250 || lowCoreCount;
+}
+
 function getCurrentZoomTransform() {
 	try {
 		if (!svgSel?.node || !d3?.zoomTransform) return { x: 0, y: 0, k: 1 };
@@ -1578,11 +1583,16 @@ function clearFindMatches() {
 	emitFindState();
 }
 
-function refreshFindMatches(rawQuery, options: { preserveActiveMatch?: boolean } = {}) {
+async function refreshFindMatches(rawQuery, options: { preserveActiveMatch?: boolean } = {}) {
 	const query = String(rawQuery || '').trim();
 	if (!query) {
 		clearFindMatches();
 		return [];
+	}
+	try {
+		await fetchAndInjectQuery(query);
+	} catch (err) {
+		console.warn('Find search API fetch failed, falling back to in-view matches:', err);
 	}
 	const previousActiveId = options.preserveActiveMatch && activeFindMatchIndex >= 0 ? activeFindMatchOrder[activeFindMatchIndex] || null : null;
 	const nodePool = [...(Array.isArray(layoutNodes) ? layoutNodes : []), ...(Array.isArray(graphData?.nodes) ? graphData.nodes : [])];
@@ -1596,11 +1606,11 @@ function refreshFindMatches(rawQuery, options: { preserveActiveMatch?: boolean }
 	return matches;
 }
 
-function cycleToFindMatch(rawQuery = activeFindQuery, direction = 1) {
+async function cycleToFindMatch(rawQuery = activeFindQuery, direction = 1) {
 	const query = String(rawQuery || '').trim();
 	let nodeIds: string[] = [];
 	if (query) {
-		const matches = refreshFindMatches(rawQuery, { preserveActiveMatch: true });
+		const matches = await refreshFindMatches(rawQuery, { preserveActiveMatch: true });
 		if (matches.length) {
 			nodeIds = matches.map((match) => match.node.id);
 		} else {
@@ -3833,15 +3843,15 @@ export function init(_d3, options: { initialRouteNodeId?: string | null } = {}) 
 		}) as EventListener);
 		window.addEventListener(FIND_QUERY_EVENT, ((event: Event) => {
 			const detail = (event as CustomEvent<{ query?: string | null }>).detail || {};
-			refreshFindMatches(detail.query, { preserveActiveMatch: true });
+			void refreshFindMatches(detail.query, { preserveActiveMatch: true });
 		}) as EventListener);
 		window.addEventListener(FIND_NEXT_EVENT, ((event: Event) => {
 			const detail = (event as CustomEvent<{ query?: string | null }>).detail || {};
-			cycleToFindMatch(detail.query || activeFindQuery, 1);
+			void cycleToFindMatch(detail.query || activeFindQuery, 1);
 		}) as EventListener);
 		window.addEventListener(FIND_PREV_EVENT, ((event: Event) => {
 			const detail = (event as CustomEvent<{ query?: string | null }>).detail || {};
-			cycleToFindMatch(detail.query || activeFindQuery, -1);
+			void cycleToFindMatch(detail.query || activeFindQuery, -1);
 		}) as EventListener);
 		window.addEventListener(FIND_MOVE_EVENT, ((event: Event) => {
 			const detail = (event as CustomEvent<{ query?: string | null; direction?: string | null }>).detail || {};
@@ -4159,408 +4169,13 @@ export function init(_d3, options: { initialRouteNodeId?: string | null } = {}) 
 				updateFetchStatus('Graph is still loading. Please try again.');
 				return;
 			}
+
 			fetchBtn.disabled = true;
 			fetchBtn.dataset.fetching = 'true';
 			fetchBtn.setAttribute('aria-busy', 'true');
+
 			try {
-				// ── 1. Search local indexed endpoints in parallel ─────────────
-				// These hit /api/finra/search and /api/finra/sec-search which query local indexes.
-				const PAGE_SIZE = 100; // FINRA Solr supports up to 100 per page
-				const fetchFinraAll = async (useFirm) => {
-					const hits = [];
-					let start = 0;
-					let total = null;
-					try {
-						do {
-							const su = makeApiUrl('/api/finra/search');
-							su.searchParams.set('query', q);
-							su.searchParams.set('rows', String(PAGE_SIZE));
-							su.searchParams.set('start', String(start));
-							if (useFirm) su.searchParams.set('firm', '1');
-							const sr = await fetch(su.toString());
-							if (!sr.ok) break;
-							const sj = await sr.json();
-							const page = sj?.hits?.hits || sj?.response?.docs || sj?.results || [];
-							if (total === null) total = sj?.hits?.total ?? sj?.response?.numFound ?? page.length;
-							hits.push(...page);
-							start += page.length;
-							if (page.length < PAGE_SIZE) break;
-						} while (start < total);
-					} catch (err) {
-						console.warn('Database search request failed', err);
-					}
-					return hits;
-				};
-
-				const fetchSec = async () => {
-					const su = makeApiUrl('/api/finra/sec-search');
-					su.searchParams.set('query', q);
-					su.searchParams.set('pageSize', '50'); // SEC pagination
-					su.searchParams.set('pageNumber', '1');
-					try {
-						const sr = await fetch(su.toString());
-						if (!sr.ok) return [];
-						const sj = await sr.json();
-						return sj?.hits?.hits || sj?.response?.docs || sj?.currentPage || sj?.results || [];
-					} catch (err) {
-						console.warn('SEC database search request failed', err);
-						return [];
-					}
-				};
-
-				const results = await Promise.allSettled([fetchFinraAll(false), fetchFinraAll(true), fetchSec()]);
-				const allHits = [];
-				results.forEach((result, index) => {
-					if (result.status === 'fulfilled') {
-						allHits.push(...result.value);
-					} else {
-						console.warn(`Database search request ${index} failed`, result.reason);
-					}
-				});
-
-				const getSearchHitIndividualId = (hit) => {
-					const src = hit?._source || hit || {};
-					const baseId = String(src?.basicInformation?.individualId || src?.ind_source_id || src?.ind_crd || '').trim();
-					if (baseId) return baseId;
-					if (typeof src?.id === 'string' && src.id.startsWith('person:')) return src.id.split(':')[1] || '';
-					if (typeof src?.content === 'string') {
-						try {
-							const parsed = JSON.parse(src.content);
-							return String(parsed?.basicInformation?.individualId || parsed?.ind_source_id || parsed?.ind_crd || '').trim();
-						} catch {
-							return '';
-						}
-					}
-					return '';
-				};
-
-				const getSearchHitFirmId = (hit) => {
-					const src = hit?._source || hit || {};
-					const baseId = String(src?.basicInformation?.firmId || src?.firm_id || src?.firmId || src?.firm_source_id || '').trim();
-					if (baseId) return baseId;
-					if (typeof src?.id === 'string' && src.id.startsWith('firm:')) return src.id.split(':')[1] || '';
-					if (typeof src?.content === 'string') {
-						try {
-							const parsed = JSON.parse(src.content);
-							return String(parsed?.basicInformation?.firmId || parsed?.firm_id || parsed?.firmId || parsed?.firm_source_id || '').trim();
-						} catch {
-							return '';
-						}
-					}
-					return '';
-				};
-
-				const hitHasIndividualId = (hit) => Boolean(getSearchHitIndividualId(hit));
-				const hitHasFirmId = (hit) => Boolean(getSearchHitFirmId(hit));
-
-				// When query is a pure number, always inject synthetic hits so the
-				// direct-by-ID lookup path runs when search could not already identify
-				// the query as an individual or firm. Avoid synthesizing the opposite
-				// kind when a real hit already exists, because that can stall the UI
-				// on an unnecessary detail request for the wrong record type.
-				if (/^\d+$/.test(q)) {
-					const hasIndividualHit = allHits.some((hit) => hitHasIndividualId(hit));
-					const hasFirmHit = allHits.some((hit) => hitHasFirmId(hit));
-					if (!hasIndividualHit && !hasFirmHit) {
-						allHits.push({ _source: { ind_source_id: q } }, { _source: { firm_id: q } });
-					}
-				}
-
-				if (!allHits.length) {
-					updateFetchStatus(`No database results for "${q}"`);
-					return;
-				}
-
-				// ── 2. Build nodes directly from search hit _source data ──────────
-				// The search results already contain ind_firstname/lastname + ind_current_employments
-				// (firm_id, firm_name) — no extra per-hit fetch needed.
-				// We only fetch full detail for pure-numeric queries (direct CRD/firm ID lookup).
-				const batchAllNodes = [];
-				const batchAllLinks = [];
-				const updatedExistingNodeIds = new Set<string>();
-
-				const isDirectId = /^\d+$/.test(q);
-
-				function addIndividualFromSource(src) {
-					// Handle FINRA search results where data is in content JSON string
-					let parsed = src;
-					if (typeof src?.content === 'string') {
-						try {
-							parsed = JSON.parse(src.content);
-						} catch {
-							// fallback to src
-						}
-					}
-
-					const crd = String(parsed?.basicInformation?.individualId || parsed?.ind_source_id || parsed?.ind_crd || '').trim();
-					if (!crd) return;
-					const existingGraphNode = findExistingPersonNode(crd);
-					const personId = existingGraphNode?.id || `person:${crd}`;
-					const personLabel = normalizePersonLabel(
-						[parsed?.basicInformation?.firstName, parsed?.basicInformation?.middleName, parsed?.basicInformation?.lastName].filter(Boolean).join(' ') ||
-							[src?.ind_firstname, src?.ind_middlename, src?.ind_lastname].filter(Boolean).join(' ') ||
-							parsed?.name ||
-							src?.name ||
-							`CRD ${crd}`,
-					);
-
-					if (existingGraphNode) {
-						existingGraphNode._trustedCurrentRelationshipData = existingGraphNode._trustedCurrentRelationshipData === true || hasRichIndividualDetail(parsed);
-						existingGraphNode.bcScope = src?.ind_bc_scope ?? parsed?.basicInformation?.bcScope ?? parsed?.bcScope ?? existingGraphNode.bcScope ?? null;
-						existingGraphNode.iaScope = src?.ind_ia_scope ?? parsed?.basicInformation?.iaScope ?? parsed?.iaScope ?? existingGraphNode.iaScope ?? null;
-						existingGraphNode.registrationCount = {
-							...(existingGraphNode.registrationCount || {}),
-							approvedFinraRegistrationCount:
-								src?.ind_approved_finra_registration_count ??
-								parsed?.registrationCount?.approvedFinraRegistrationCount ??
-								existingGraphNode.registrationCount?.approvedFinraRegistrationCount ??
-								0,
-							approvedSRORegistrationCount:
-								src?.ind_approved_sro_registration_count ??
-								parsed?.registrationCount?.approvedSRORegistrationCount ??
-								existingGraphNode.registrationCount?.approvedSRORegistrationCount ??
-								0,
-							approvedStateRegistrationCount:
-								src?.ind_approved_state_registration_count ??
-								parsed?.registrationCount?.approvedStateRegistrationCount ??
-								existingGraphNode.registrationCount?.approvedStateRegistrationCount ??
-								0,
-							approvedIAStateRegistrationCount:
-								src?.ind_approved_ia_state_registration_count ??
-								parsed?.registrationCount?.approvedIAStateRegistrationCount ??
-								existingGraphNode.registrationCount?.approvedIAStateRegistrationCount ??
-								0,
-						};
-						existingGraphNode.currentEmployments =
-							Array.isArray(src?.ind_current_employments) ? src.ind_current_employments
-							: Array.isArray(parsed?.currentEmployments) ? parsed.currentEmployments
-							: (existingGraphNode.currentEmployments ?? []);
-						existingGraphNode.currentIAEmployments =
-							Array.isArray(src?.ind_ia_current_employments) ? src.ind_ia_current_employments
-							: Array.isArray(parsed?.currentIAEmployments) ? parsed.currentIAEmployments
-							: (existingGraphNode.currentIAEmployments ?? []);
-						applyIndividualDetail(existingGraphNode, parsed, crd);
-						updatedExistingNodeIds.add(existingGraphNode.id);
-					} else if (!batchAllNodes.some((n) => n.id === personId)) {
-						// Propagate disclosure flags if present
-						const disclosureFlag = parsed?.disclosureFlag ?? parsed?.basicInformation?.disclosureFlag ?? parsed?.ind_bc_disclosure_fl;
-						const iaDisclosureFlag = parsed?.iaDisclosureFlag ?? parsed?.basicInformation?.iaDisclosureFlag ?? parsed?.ind_bc_disclosure_fl;
-						batchAllNodes.push(
-							applyIndividualDetail(
-								{
-									id: personId,
-									label: personLabel,
-									group: 'individual',
-									crd,
-									bcScope: src?.ind_bc_scope ?? parsed?.basicInformation?.bcScope ?? parsed?.bcScope ?? null,
-									iaScope: src?.ind_ia_scope ?? parsed?.basicInformation?.iaScope ?? parsed?.iaScope ?? null,
-									registrationCount: {
-										approvedFinraRegistrationCount: src?.ind_approved_finra_registration_count ?? parsed?.registrationCount?.approvedFinraRegistrationCount ?? 0,
-										approvedSRORegistrationCount: src?.ind_approved_sro_registration_count ?? parsed?.registrationCount?.approvedSRORegistrationCount ?? 0,
-										approvedStateRegistrationCount: src?.ind_approved_state_registration_count ?? parsed?.registrationCount?.approvedStateRegistrationCount ?? 0,
-										approvedIAStateRegistrationCount: src?.ind_approved_ia_state_registration_count ?? parsed?.registrationCount?.approvedIAStateRegistrationCount ?? 0,
-									},
-									currentEmployments: Array.isArray(src?.ind_current_employments) ? src.ind_current_employments : (parsed?.currentEmployments ?? []),
-									currentIAEmployments: Array.isArray(src?.ind_ia_current_employments) ? src.ind_ia_current_employments : (parsed?.currentIAEmployments ?? []),
-									disclosureFlag,
-									iaDisclosureFlag,
-									_trustedCurrentRelationshipData: hasRichIndividualDetail(parsed),
-								},
-								parsed,
-								crd,
-							),
-						);
-					}
-					// Build firm connections from embedded employment data
-					const emps = [
-						...(parsed?.currentEmployments || []).map((e) => ({ ...e, _isCurrent: true })),
-						...(parsed?.currentIAEmployments || []).map((e) => ({ ...e, _isCurrent: true })),
-						...(parsed?.previousEmployments || []).map((e) => ({ ...e, _isCurrent: false })),
-						...(parsed?.previousIAEmployments || []).map((e) => ({ ...e, _isCurrent: false })),
-						...(src?.ind_current_employments || []).map((e) => ({ ...e, _isCurrent: true })),
-					];
-					for (const e of emps) {
-						const fid = String(e?.firmId || e?.firm_id || e?.firmIdNumber || e?.firmId || '').trim();
-						if (!fid) continue;
-						const existingFirmNode = findExistingFirmNode(fid);
-						const firmNodeId = existingFirmNode?.id || `firm:${fid}`;
-						if (!existingFirmNode && !batchAllNodes.some((n) => n.id === firmNodeId)) {
-							batchAllNodes.push({
-								id: firmNodeId,
-								label: e?.firm_name || e?.firmName || `Firm ${fid}`,
-								group: 'firm',
-								firmId: fid,
-								bdSecNumber: e?.firm_bd_sec_number || e?.bdSecNumber,
-								iaSecNumber: e?.firm_ia_sec_number || e?.iaSecNumber,
-							});
-						}
-						if (!batchAllLinks.some((l) => (l.source?.id ?? l.source) === personId && (l.target?.id ?? l.target) === firmNodeId)) {
-							batchAllLinks.push({
-								source: personId,
-								target: firmNodeId,
-								relationship: getEmploymentRelationship(e),
-								isCurrent: e._isCurrent,
-							});
-						}
-					}
-				}
-
-				function addFirmFromSource(src) {
-					const firmId = getSearchHitFirmId(src);
-					if (!firmId) return;
-					const firmNodeId = `firm:${firmId}`;
-					const firmLabel = src?.firm_name || src?.firmName || src?.name || `Firm ${firmId}`;
-					if (!batchAllNodes.some((n) => n.id === firmNodeId)) {
-						// Propagate disclosure flags if present
-						const disclosureFlag = src?.disclosureFlag ?? src?.firm_disclosure_flag;
-						const iaDisclosureFlag = src?.iaDisclosureFlag;
-						batchAllNodes.push({
-							id: firmNodeId,
-							label: firmLabel,
-							group: 'firm',
-							firmId,
-							bdSecNumber: src?.firm_bd_sec_number || src?.bdSecNumber,
-							iaSecNumber: src?.firm_ia_sec_number || src?.iaSecNumber,
-							disclosureFlag,
-							iaDisclosureFlag,
-						});
-					}
-				}
-
-				if (isDirectId) {
-					// For direct numeric CRD/firm ID — fetch full detail to get rich sidebar data
-					await Promise.allSettled(
-						allHits.map(async (hit) => {
-							const src = hit._source || hit;
-							const crd = getSearchHitIndividualId(src);
-							if (crd && /^\d+$/.test(crd)) {
-								try {
-									const r = await fetch(`${BASE}/api/finra/individual/${encodeURIComponent(crd)}`);
-									if (!r.ok) throw new Error(`${r.status}`);
-									const detail = unwrapDetailPayload(await r.json());
-									if (detail?.found === false) return;
-									addIndividualFromSource(detail);
-								} catch {
-									// Ignore the synthetic direct-id fallback when the lookup fails.
-								}
-								return;
-							}
-							const firmId = String(src?.firm_id || src?.firmId || src?.firm_source_id || '').trim();
-							if (firmId && /^\d+$/.test(firmId)) {
-								try {
-									const r = await fetch(`${BASE}/api/finra/firm/${encodeURIComponent(firmId)}`);
-									if (!r.ok) throw new Error(`${r.status}`);
-									const detail = await r.json();
-									if (detail?.found === false) return;
-									const firmNodeId = `firm:${firmId}`;
-									const bi = detail?.basicInformation || {};
-									const firmLabel = bi.firmName || detail?.firmName || detail?.name || `Firm ${firmId}`;
-									if (!batchAllNodes.some((n) => n.id === firmNodeId)) {
-										batchAllNodes.push({
-											id: firmNodeId,
-											label: firmLabel,
-											group: 'firm',
-											firmId,
-											bcScope: bi.bcScope ?? detail?.bcScope ?? null,
-											firmStatus: bi.firmStatus ?? detail?.firmStatus,
-											firmStatusDate: bi.firmStatusDate ?? detail?.firmStatusDate,
-											firmType: bi.firmType ?? detail?.firmType,
-											formedState: bi.formedState ?? detail?.formedState,
-											formedDate: bi.formedDate ?? detail?.formedDate,
-											regulator: bi.regulator ?? detail?.regulator,
-											bdSecNumber: bi.bdSECNumber ?? bi.bdSecNumber ?? detail?.bdSECNumber ?? detail?.bdSecNumber,
-											iaSecNumber: bi.iaSecNumber ?? detail?.iaSecNumber,
-											isLegacy: bi.isLegacy ?? detail?.isLegacy,
-											fiscalYearEnd: bi.fiscalMonthEndCode ?? detail?.fiscalMonthEndCode,
-											otherNames: bi.otherNames ?? detail?.otherNames ?? [],
-											selfRegulatoryOrgs: detail?.selfRegulatoryOrgs ?? detail?.SROs ?? [],
-											activeStates: detail?.activeStates ?? detail?.registeredStates ?? [],
-											directOwners: detail?.directOwners ?? [],
-											disclosures: detail?.disclosures ?? [],
-										});
-									}
-									for (const o of detail?.directOwners || []) {
-										const pid = String(o?.crdNumber || o?.crd || o?.personId || '').trim();
-										if (!pid) continue;
-										const personNodeId = `person:${pid}`;
-										if (!batchAllNodes.some((n) => n.id === personNodeId)) {
-											batchAllNodes.push({
-												id: personNodeId,
-												label: normalizePersonLabel(o?.legalName || o?.name || `Person ${pid}`),
-												group: 'individual',
-												crd: pid,
-												bcScope: o?.bcScope || null,
-												stub: true,
-											});
-										}
-										if (!batchAllLinks.some((l) => (l.source?.id ?? l.source) === personNodeId && (l.target?.id ?? l.target) === firmNodeId)) {
-											batchAllLinks.push({
-												source: personNodeId,
-												target: firmNodeId,
-												relationship: 'controls',
-											});
-										}
-									}
-								} catch {
-									// Ignore the synthetic direct-id fallback when the lookup fails.
-								}
-								return;
-							}
-						}),
-					);
-				} else {
-					// Text search — build nodes directly from search _source (fast, no extra fetches)
-					for (const hit of allHits) {
-						const src = hit._source || hit;
-						const crd = getSearchHitIndividualId(src);
-						if (crd) {
-							addIndividualFromSource(src);
-							continue;
-						}
-						const firmId = getSearchHitFirmId(src);
-						if (firmId) {
-							addFirmFromSource(src);
-							continue;
-						}
-						// stub for hits with no ID
-						const label = normalizePersonLabel(src?.name || [src?.ind_firstname, src?.ind_middlename, src?.ind_lastname].filter(Boolean).join(' ') || '');
-						if (label)
-							batchAllNodes.push({
-								id: `database:${Date.now()}:${Math.random()}`,
-								label,
-								group: 'individual',
-							});
-					}
-				}
-
-				// ── 3. Append all nodes/links to the live view ─────────────────────
-				if (batchAllNodes.length === 0) {
-					updateFetchStatus(`No structured data found for "${q}"`);
-					return;
-				}
-				scheduleFirstFetchFocusIfAvailable(
-					batchAllNodes.map((n) => n.id),
-					{
-						duration: 700,
-						maxScale: 1.05,
-					},
-				);
-				appendFetched(batchAllNodes, batchAllLinks);
-
-				// ── 4. Update in-memory graphData so filter/subset sees new nodes ──
-				mergeIntoGraphData(batchAllNodes, batchAllLinks);
-				if (updatedExistingNodeIds.size) {
-					rerenderGraphNodesByIds(Array.from(updatedExistingNodeIds));
-					refreshGraphColors();
-					refreshTraceState();
-				}
-
-				// ── 6. Persist to server so data survives page reload ──────────────
-				persistToServer(batchAllNodes, batchAllLinks);
-				void fetchCacheStats();
-
-				const newCount = batchAllNodes.length;
-				updateFetchStatus(`Added ${newCount} node${newCount !== 1 ? 's' : ''} for "${q}"`);
+				await fetchAndInjectQuery(q);
 				focusExistingNodeMatch(q, { statusPrefix: 'Opened' });
 			} catch (err) {
 				console.error('database search failed', err);
@@ -4754,120 +4369,27 @@ function normalizeSearchNode(hit) {
 }
 
 async function fetchAndInjectQuery(q) {
-	const ROWS = '1000';
-	const headers = { Accept: 'application/json' };
+	const url = makeApiUrl(`/api/graph/search?q=${encodeURIComponent(q)}`).toString();
 
-	const [finraIndResp, finraFirmResp, secResp] = await Promise.allSettled([
-		fetch(makeApiUrl(`/api/finra/search?query=${encodeURIComponent(q)}&rows=${ROWS}&_=${Date.now()}`).toString(), { headers, cache: 'no-store' }).then((r) =>
-			r.ok ? r.json() : null,
-		),
-		fetch(makeApiUrl(`/api/finra/search?query=${encodeURIComponent(q)}&firm=1&rows=${ROWS}&_=${Date.now()}`).toString(), { headers, cache: 'no-store' }).then((r) =>
-			r.ok ? r.json() : null,
-		),
-		fetch(makeApiUrl(`/api/finra/sec-search?query=${encodeURIComponent(q)}`).toString(), { headers }).then((r) => (r.ok ? r.json() : null)),
-	]);
-
-	const extractHits = (res) => {
-		const d = res.status === 'fulfilled' ? res.value : null;
-		return coerceSearchHits(d);
-	};
-
-	const allHits = [...extractHits(finraIndResp), ...extractHits(finraFirmResp), ...extractHits(secResp)];
-
-	if (!allHits.length) return;
-
-	const newNodes = [];
-	const newLinks = [];
-	const seenNodes = new Set(layoutNodes ? layoutNodes.map((n) => n.id) : []);
-
-	for (const hit of allHits) {
-		const { src, parsed, kind, crd, firmId, nodeId, label } = normalizeSearchNode(hit);
-		const existingNodeId =
-			nodeId ||
-			(kind === 'individual' ? `finra:individual:${crd}`
-			: kind === 'firm' ? `finra:firm:${firmId}`
-			: '');
-
-		if (kind === 'individual' || crd) {
-			if (!seenNodes.has(existingNodeId)) {
-				seenNodes.add(existingNodeId);
-				const disclosureFlag = src?.disclosureFlag ?? src?.ind_bc_disclosure_fl ?? parsed?.disclosureFlag ?? parsed?.basicInformation?.disclosureFlag ?? null;
-				const iaDisclosureFlag = src?.iaDisclosureFlag ?? parsed?.iaDisclosureFlag ?? parsed?.basicInformation?.iaDisclosureFlag ?? null;
-				newNodes.push({
-					id: existingNodeId,
-					label,
-					group: 'individual',
-					crd,
-					bcScope: src?.bcScope ?? src?.ind_bc_scope ?? parsed?.basicInformation?.bcScope ?? null,
-					iaScope: src?.iaScope ?? src?.ind_ia_scope ?? parsed?.basicInformation?.iaScope ?? null,
-					registrationCount: {
-						approvedFinraRegistrationCount: src?.ind_approved_finra_registration_count ?? parsed?.registrationCount?.approvedFinraRegistrationCount ?? 0,
-						approvedSRORegistrationCount: src?.ind_approved_sro_registration_count ?? parsed?.registrationCount?.approvedSRORegistrationCount ?? 0,
-						approvedStateRegistrationCount: src?.ind_approved_state_registration_count ?? parsed?.registrationCount?.approvedStateRegistrationCount ?? 0,
-						approvedIAStateRegistrationCount: src?.ind_approved_ia_state_registration_count ?? parsed?.registrationCount?.approvedIAStateRegistrationCount ?? 0,
-					},
-					currentEmployments:
-						Array.isArray(src?.ind_current_employments) ? src.ind_current_employments
-						: Array.isArray(parsed?.currentEmployments) ? parsed.currentEmployments
-						: [],
-					currentIAEmployments:
-						Array.isArray(src?.ind_ia_current_employments) ? src.ind_ia_current_employments
-						: Array.isArray(parsed?.currentIAEmployments) ? parsed.currentIAEmployments
-						: [],
-					disclosureFlag,
-					iaDisclosureFlag,
-					_trustedCurrentRelationshipData: hasRichIndividualDetail(parsed),
-					_source: 'finra',
-				});
-
-				const emps =
-					Array.isArray(src?.ind_current_employments) ? src.ind_current_employments
-					: Array.isArray(parsed?.currentEmployments) ? parsed.currentEmployments
-					: [];
-				for (const e of emps) {
-					const fid = String(e?.firm_id || e?.firmId || e?.firmIdNumber || '').trim();
-					if (!fid) continue;
-					const firmNodeId = `finra:firm:${fid}`;
-					if (!seenNodes.has(firmNodeId)) {
-						seenNodes.add(firmNodeId);
-						newNodes.push({
-							id: firmNodeId,
-							label: e?.firm_name || e?.firmName || `Firm ${fid}`,
-							group: 'firm',
-							firmId: fid,
-							_source: 'finra',
-						});
-					}
-					newLinks.push({
-						source: existingNodeId,
-						target: firmNodeId,
-						relationship: 'employed_by',
-						isCurrent: true,
-					});
-				}
-			}
-			continue;
+	let data;
+	try {
+		const res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+		if (!res.ok) {
+			throw new Error(`Graph search failed: ${res.status}`);
 		}
-
-		if (kind === 'firm' || firmId) {
-			const firmNodeId = existingNodeId || `finra:firm:${firmId}`;
-			if (!seenNodes.has(firmNodeId)) {
-				seenNodes.add(firmNodeId);
-				const disclosureFlag = src?.disclosureFlag ?? src?.firm_disclosure_flag ?? null;
-				const iaDisclosureFlag = src?.iaDisclosureFlag ?? null;
-				newNodes.push({
-					id: firmNodeId,
-					label,
-					group: 'firm',
-					firmId,
-					bcScope: src?.bcScope ?? src?.firm_bc_scope ?? null,
-					disclosureFlag,
-					iaDisclosureFlag,
-					_source: 'finra',
-				});
-			}
-		}
+		data = await res.json();
+	} catch (err) {
+		throw new Error(err instanceof Error ? err.message : 'Graph search failed');
 	}
+
+	const newNodes =
+		Array.isArray(data?.visibleNodes) ? data.visibleNodes
+		: Array.isArray(data?.nodes) ? data.nodes
+		: [];
+	const newLinks =
+		Array.isArray(data?.visibleLinks) ? data.visibleLinks
+		: Array.isArray(data?.links) ? data.links
+		: [];
 
 	if (!newNodes.length) return;
 
@@ -4897,121 +4419,25 @@ async function fetchLocalQueryBatch(q) {
 // Batch variant of the full text query that returns nodes/links without
 // appending. Mirrors `fetchAndInjectQuery` logic but returns the results.
 async function fetchQueryBatch(q) {
-	const ROWS = '1000';
-	const headers = { Accept: 'application/json' };
+	const url = makeApiUrl(`/api/graph/search?q=${encodeURIComponent(q)}`).toString();
 
-	const [finraIndResp, finraFirmResp, secResp] = await Promise.allSettled([
-		fetch(makeApiUrl(`/api/finra/search?query=${encodeURIComponent(q)}&rows=${ROWS}&_=${Date.now()}`).toString(), { headers, cache: 'no-store' }).then((r) =>
-			r.ok ? r.json() : null,
-		),
-		fetch(makeApiUrl(`/api/finra/search?query=${encodeURIComponent(q)}&firm=1&rows=${ROWS}&_=${Date.now()}`).toString(), { headers, cache: 'no-store' }).then((r) =>
-			r.ok ? r.json() : null,
-		),
-		fetch(makeApiUrl(`/api/finra/sec-search?query=${encodeURIComponent(q)}`).toString(), { headers }).then((r) => (r.ok ? r.json() : null)),
-	]);
-
-	const extractHits = (res) => {
-		const d = res.status === 'fulfilled' ? res.value : null;
-		return coerceSearchHits(d);
-	};
-
-	const allHits = [...extractHits(finraIndResp), ...extractHits(finraFirmResp), ...extractHits(secResp)];
-
-	if (!allHits.length) return { nodes: [], links: [] };
-
-	const newNodes = [];
-	const newLinks = [];
-	const seenNodes = new Set(layoutNodes ? layoutNodes.map((n) => n.id) : []);
-
-	for (const hit of allHits) {
-		const { src, parsed, kind, crd, firmId, nodeId, label } = normalizeSearchNode(hit);
-		const existingNodeId =
-			nodeId ||
-			(kind === 'individual' ? `finra:individual:${crd}`
-			: kind === 'firm' ? `finra:firm:${firmId}`
-			: '');
-
-		if (kind === 'individual' || crd) {
-			if (!seenNodes.has(existingNodeId)) {
-				seenNodes.add(existingNodeId);
-				const disclosureFlag = src?.disclosureFlag ?? src?.ind_bc_disclosure_fl ?? parsed?.disclosureFlag ?? parsed?.basicInformation?.disclosureFlag ?? null;
-				const iaDisclosureFlag = src?.iaDisclosureFlag ?? parsed?.iaDisclosureFlag ?? parsed?.basicInformation?.iaDisclosureFlag ?? null;
-				newNodes.push({
-					id: existingNodeId,
-					label,
-					group: 'individual',
-					crd,
-					bcScope: src?.bcScope ?? src?.ind_bc_scope ?? parsed?.basicInformation?.bcScope ?? null,
-					iaScope: src?.iaScope ?? src?.ind_ia_scope ?? parsed?.basicInformation?.iaScope ?? null,
-					registrationCount: {
-						approvedFinraRegistrationCount: src?.ind_approved_finra_registration_count ?? parsed?.registrationCount?.approvedFinraRegistrationCount ?? 0,
-						approvedSRORegistrationCount: src?.ind_approved_sro_registration_count ?? parsed?.registrationCount?.approvedSRORegistrationCount ?? 0,
-						approvedStateRegistrationCount: src?.ind_approved_state_registration_count ?? parsed?.registrationCount?.approvedStateRegistrationCount ?? 0,
-						approvedIAStateRegistrationCount: src?.ind_approved_ia_state_registration_count ?? parsed?.registrationCount?.approvedIAStateRegistrationCount ?? 0,
-					},
-					currentEmployments:
-						Array.isArray(src?.ind_current_employments) ? src.ind_current_employments
-						: Array.isArray(parsed?.currentEmployments) ? parsed.currentEmployments
-						: [],
-					currentIAEmployments:
-						Array.isArray(src?.ind_ia_current_employments) ? src.ind_ia_current_employments
-						: Array.isArray(parsed?.currentIAEmployments) ? parsed.currentIAEmployments
-						: [],
-					disclosureFlag,
-					iaDisclosureFlag,
-					_source: 'finra',
-				});
-
-				const emps =
-					Array.isArray(src?.ind_current_employments) ? src.ind_current_employments
-					: Array.isArray(parsed?.currentEmployments) ? parsed.currentEmployments
-					: [];
-				for (const e of emps) {
-					const fid = String(e?.firm_id || e?.firmId || e?.firmIdNumber || '').trim();
-					if (!fid) continue;
-					const firmNodeId = `finra:firm:${fid}`;
-					if (!seenNodes.has(firmNodeId)) {
-						seenNodes.add(firmNodeId);
-						newNodes.push({
-							id: firmNodeId,
-							label: e?.firm_name || e?.firmName || `Firm ${fid}`,
-							group: 'firm',
-							firmId: fid,
-							_source: 'finra',
-						});
-					}
-					newLinks.push({
-						source: existingNodeId,
-						target: firmNodeId,
-						relationship: 'employed_by',
-						isCurrent: true,
-					});
-				}
-			}
-			continue;
-		}
-
-		if (kind === 'firm' || firmId) {
-			const firmNodeId = existingNodeId || `finra:firm:${firmId}`;
-			if (!seenNodes.has(firmNodeId)) {
-				seenNodes.add(firmNodeId);
-				const disclosureFlag = src?.disclosureFlag ?? src?.firm_disclosure_flag ?? null;
-				const iaDisclosureFlag = src?.iaDisclosureFlag ?? null;
-				newNodes.push({
-					id: firmNodeId,
-					label,
-					group: 'firm',
-					firmId,
-					bcScope: src?.bcScope ?? src?.firm_bc_scope ?? null,
-					disclosureFlag,
-					iaDisclosureFlag,
-					_source: 'finra',
-				});
-			}
-		}
+	try {
+		const res = await fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+		if (!res.ok) return { nodes: [], links: [] };
+		const data = await res.json();
+		return {
+			nodes:
+				Array.isArray(data?.visibleNodes) ? data.visibleNodes
+				: Array.isArray(data?.nodes) ? data.nodes
+				: [],
+			links:
+				Array.isArray(data?.visibleLinks) ? data.visibleLinks
+				: Array.isArray(data?.links) ? data.links
+				: [],
+		};
+	} catch {
+		return { nodes: [], links: [] };
 	}
-
-	return { nodes: newNodes, links: newLinks };
 }
 
 function updateGraphMeta() {
@@ -7374,12 +6800,14 @@ function renderGraph(_data) {
 
 	// Scale params based on graph size — used by both zoom LOD and simulation setup
 	const nodeCount = nodes.length;
+	const useCanvasRenderer = shouldUseCanvasRenderer(nodeCount);
 	const isLarge = nodeCount > 300;
 	const isHuge = nodeCount > 1000;
 	setGraphLabelRenderMode(nodeCount);
 
-	// Enable hardware-accelerated WebGL mode for very large graphs; fall back to Canvas
-	canvasModeActive = nodeCount > 800;
+	// Prefer canvas/WebGL rendering once the graph grows beyond a medium-sized subset.
+	// This reduces SVG DOM churn and keeps the heavy path on GPU-friendly drawing.
+	canvasModeActive = useCanvasRenderer;
 	let pixiModeActive = false;
 	let pixiApi: any = null;
 	if (canvasModeActive) {
