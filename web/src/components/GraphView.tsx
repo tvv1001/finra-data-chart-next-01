@@ -25,13 +25,14 @@ import { drawFirmNode, drawPersonNode } from '@/lib/geometry';
 
 // --- Constants & Config ---
 const CLICK_REVEAL_HOPS = 3;
-const CLICK_REVEAL_HIGHLIGHT_MS = 1100;
 const VISIBLE_NODE_IDS_STORAGE_KEY = 'graph-visible-node-ids-startup-leaders-v1';
+const NODE_POSITION_STORAGE_KEY = 'graph-node-positions-v1';
+const NODE_POSITION_TTL_MS = 1000 * 60 * 60 * 24 * 365 * 5;
 // react-force-graph-2d radius = sqrt(nodeVal × NODE_REL_SIZE). Setting this to 100
 // (vs default 4) makes the smallest node 5× bigger while preserving relative scale.
 const NODE_REL_SIZE = 100;
-const SIM_LINK_DISTANCE = 720;
-const SIM_CHARGE_STRENGTH = -560;
+const SIM_LINK_DISTANCE = 880;
+const SIM_CHARGE_STRENGTH = -720;
 const DRAG_CHILD_OFFSET_SCALE = 0.88;
 
 type InitialGraphState = {
@@ -40,18 +41,37 @@ type InitialGraphState = {
 	selectedNodeId: string | null;
 	visitedNodeIds: Set<string>;
 	needsInitialLoad: boolean;
+	storedPositions: Map<string, { x: number; y: number }>;
 };
+
+function loadStoredNodePositions(): Map<string, { x: number; y: number }> {
+	if (typeof window === 'undefined') return new Map();
+	try {
+		const raw = window.localStorage.getItem(NODE_POSITION_STORAGE_KEY);
+		if (!raw) return new Map();
+		const parsed = JSON.parse(raw) as { savedAt?: string; positions?: Record<string, { x: number; y: number }> };
+		const savedAt = parsed?.savedAt ? Date.parse(parsed.savedAt) : Number.NaN;
+		if (!Number.isFinite(savedAt) || Date.now() - savedAt > NODE_POSITION_TTL_MS) {
+			window.localStorage.removeItem(NODE_POSITION_STORAGE_KEY);
+			return new Map();
+		}
+		return new Map(Object.entries(parsed.positions ?? {}).filter(([, pos]) => Number.isFinite(pos?.x) && Number.isFinite(pos?.y)));
+	} catch {
+		return new Map();
+	}
+}
 
 function computeInitialState(): InitialGraphState {
 	const dataset = createGraphDataset();
 	if (typeof window === 'undefined') {
-		return { dataset, visibleNodeIds: new Set(), selectedNodeId: null, visitedNodeIds: new Set(), needsInitialLoad: false };
+		return { dataset, visibleNodeIds: new Set(), selectedNodeId: null, visitedNodeIds: new Set(), needsInitialLoad: false, storedPositions: new Map() };
 	}
+	const storedPositions = loadStoredNodePositions();
 	const pathMatch = window.location.pathname.match(/^\/node\/([^/]+)$/);
 	if (pathMatch) {
 		const nodeId = pathMatch[1];
 		if (dataset.nodeById.has(nodeId)) {
-			return { dataset, visibleNodeIds: expandSelection(dataset, nodeId), selectedNodeId: nodeId, visitedNodeIds: new Set(), needsInitialLoad: false };
+			return { dataset, visibleNodeIds: expandSelection(dataset, nodeId), selectedNodeId: nodeId, visitedNodeIds: new Set(), needsInitialLoad: false, storedPositions };
 		}
 	}
 	try {
@@ -65,16 +85,18 @@ function computeInitialState(): InitialGraphState {
 					selectedNodeId: stored.selectedNodeId ?? null,
 					visitedNodeIds: new Set(stored.visitedNodeIds ?? []),
 					needsInitialLoad: false,
+					storedPositions,
 				};
 			}
 		}
 	} catch {}
-	return { dataset, visibleNodeIds: new Set(), selectedNodeId: null, visitedNodeIds: new Set(), needsInitialLoad: true };
+	return { dataset, visibleNodeIds: new Set(), selectedNodeId: null, visitedNodeIds: new Set(), needsInitialLoad: false, storedPositions };
 }
 
 export default function GraphView() {
 	// Compute initial state once via lazy useState (avoids ref-during-render)
-	const [{ dataset: initDataset, visibleNodeIds: initVisible, selectedNodeId: initSelected, visitedNodeIds: initVisited, needsInitialLoad }] = useState(computeInitialState);
+	const [{ dataset: initDataset, visibleNodeIds: initVisible, selectedNodeId: initSelected, visitedNodeIds: initVisited, needsInitialLoad, storedPositions }] =
+		useState(computeInitialState);
 
 	const [dataset, setDataset] = useState<GraphDataset>(() => initDataset);
 	const graphRef = useRef<ForceGraphMethods<NodeObject<GraphNode>, LinkObject<GraphNode, GraphLink>> | undefined>(undefined);
@@ -84,9 +106,10 @@ export default function GraphView() {
 	const [selectedNodeId, setSelectedNodeId] = useState<string | null>(() => initSelected);
 	const [visitedNodeIds, setVisitedNodeIds] = useState<Set<string>>(() => initVisited);
 	const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
-	const [recentlyRevealedNodeIds, setRecentlyRevealedNodeIds] = useState<Set<string>>(() => new Set());
 	const [searchQuery, setSearchQuery] = useState('');
-	const [statusMessage, setStatusMessage] = useState('Ready. Search a name like "thornton" to display the graph.');
+	const [statusMessage, setStatusMessage] = useState(() =>
+		needsInitialLoad ? 'Search to load nodes into the graph.' : 'Ready. Search a name like "thornton" to display the graph.',
+	);
 	const [showInfo, setShowInfo] = useState(true);
 	const [showLog, setShowLog] = useState(false);
 	const [traceMode, setTraceMode] = useState(false);
@@ -95,6 +118,8 @@ export default function GraphView() {
 	const [panelPinned, setPanelPinned] = useState(true);
 
 	const dragChildOffsetsRef = useRef<{ node: GraphNode & NodeObject; dx: number; dy: number }[]>([]);
+	const hasAppliedStoredPositionsRef = useRef(false);
+	const searchStreamTimeoutsRef = useRef<number[]>([]);
 
 	// WASM force simulation refs
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -304,72 +329,143 @@ export default function GraphView() {
 		};
 	}, [dataset]);
 
-	const mergeGraphData = useCallback((incoming: { nodes: GraphNode[]; links: GraphLink[] }) => {
-		setDataset((currentDataset) => {
-			const nodeMap = new Map(currentDataset.graphData.nodes.map((node) => [node.id, node]));
-			for (const node of incoming.nodes) nodeMap.set(node.id, node);
-			const mergedNodes = Array.from(nodeMap.values());
-			const linkMap = new Map<string, GraphLink>();
-			const addLink = (link: GraphLink) => {
-				const source = getEndpointId(link.source);
-				const target = getEndpointId(link.target);
-				const key = source < target ? `${source}:${target}` : `${target}:${source}`;
-				if (!linkMap.has(key)) linkMap.set(key, link);
-			};
-			for (const link of currentDataset.graphData.links) addLink(link);
-			for (const link of incoming.links) addLink(link);
-			const mergedLinks = Array.from(linkMap.values());
+	useEffect(() => {
+		if (hasAppliedStoredPositionsRef.current) return;
+		hasAppliedStoredPositionsRef.current = true;
+		for (const [nodeId, position] of storedPositions) {
+			const node = dataset.nodeById.get(nodeId);
+			if (!node) continue;
+			node.x = position.x;
+			node.y = position.y;
+		}
+	}, [dataset, storedPositions]);
 
-			// Rebuild Graphology graph for adjacency/data lookups (no FA2-specific attributes)
-			const graph = new Graph({ multi: false, type: 'undirected', allowSelfLoops: false });
-			const spread = 3000;
-			for (const node of mergedNodes) {
-				const prevX = currentDataset.graph.hasNode(node.id) ? (currentDataset.graph.getNodeAttribute(node.id, 'x') as number | undefined) : undefined;
-				const prevY = currentDataset.graph.hasNode(node.id) ? (currentDataset.graph.getNodeAttribute(node.id, 'y') as number | undefined) : undefined;
-				graph.addNode(node.id, {
-					...node,
-					x: prevX ?? (Math.random() - 0.5) * spread,
-					y: prevY ?? (Math.random() - 0.5) * spread,
-				});
-			}
-			for (const link of mergedLinks) {
-				const src = getEndpointId(link.source);
-				const tgt = getEndpointId(link.target);
-				if (src !== tgt && graph.hasNode(src) && graph.hasNode(tgt) && !graph.hasEdge(src, tgt)) {
-					graph.addEdge(src, tgt, link);
+	const mergeGraphData = useCallback(
+		(incoming: { nodes: GraphNode[]; links: GraphLink[] }) => {
+			setDataset((currentDataset) => {
+				const nodeMap = new Map(currentDataset.graphData.nodes.map((node) => [node.id, node]));
+				for (const node of incoming.nodes) {
+					const existing = nodeMap.get(node.id);
+					if (existing) {
+						nodeMap.set(node.id, { ...existing, ...node });
+					} else {
+						nodeMap.set(node.id, node);
+					}
 				}
-			}
+				const mergedNodes = Array.from(nodeMap.values());
+				const linkMap = new Map<string, GraphLink>();
+				const addLink = (link: GraphLink) => {
+					const source = getEndpointId(link.source);
+					const target = getEndpointId(link.target);
+					const key = source < target ? `${source}:${target}` : `${target}:${source}`;
+					if (!linkMap.has(key)) linkMap.set(key, link);
+				};
+				for (const link of currentDataset.graphData.links) addLink(link);
+				for (const link of incoming.links) addLink(link);
+				const mergedLinks = Array.from(linkMap.values());
 
-			return {
-				...currentDataset,
-				graph,
-				graphData: { nodes: mergedNodes, links: mergedLinks },
-				adjacency: createAdjacencyMap(mergedLinks),
-				linksByNodeId: createLinksByNodeId(mergedLinks),
-				nodeById: new Map(mergedNodes.map((node) => [node.id, node])),
-			};
-		});
+				// Rebuild Graphology graph for adjacency/data lookups (no FA2-specific attributes)
+				const graph = new Graph({ multi: false, type: 'undirected', allowSelfLoops: false });
+				const spread = 3000;
+				for (const node of mergedNodes) {
+					const stored = storedPositions.get(node.id);
+					const prevX = currentDataset.graph.hasNode(node.id) ? (currentDataset.graph.getNodeAttribute(node.id, 'x') as number | undefined) : undefined;
+					const prevY = currentDataset.graph.hasNode(node.id) ? (currentDataset.graph.getNodeAttribute(node.id, 'y') as number | undefined) : undefined;
+					graph.addNode(node.id, {
+						...node,
+						x: stored?.x ?? prevX ?? (Math.random() - 0.5) * spread,
+						y: stored?.y ?? prevY ?? (Math.random() - 0.5) * spread,
+					});
+				}
+				for (const link of mergedLinks) {
+					const src = getEndpointId(link.source);
+					const tgt = getEndpointId(link.target);
+					if (src !== tgt && graph.hasNode(src) && graph.hasNode(tgt) && !graph.hasEdge(src, tgt)) {
+						graph.addEdge(src, tgt, link);
+					}
+				}
+
+				return {
+					...currentDataset,
+					graph,
+					graphData: { nodes: mergedNodes, links: mergedLinks },
+					adjacency: createAdjacencyMap(mergedLinks),
+					linksByNodeId: createLinksByNodeId(mergedLinks),
+					nodeById: new Map(mergedNodes.map((node) => [node.id, node])),
+				};
+			});
+		},
+		[storedPositions],
+	);
+
+	const clearSearchStreamTimers = useCallback(() => {
+		for (const timeoutId of searchStreamTimeoutsRef.current) {
+			window.clearTimeout(timeoutId);
+		}
+		searchStreamTimeoutsRef.current = [];
 	}, []);
 
-	const loadInitialNodes = useCallback(async () => {
-		setStatusMessage('Loading entire graph...');
-		try {
-			const response = await fetch('/api/graph/search?all=true');
-			if (!response.ok) throw new Error('Initial load failed');
-			const result = (await response.json()) as { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[] };
-			mergeGraphData({ nodes: result.visibleNodes, links: result.visibleLinks });
-			setVisibleNodeIds(new Set(result.visibleNodeIds));
-		} catch {
-			setStatusMessage('Failed to load graph.');
-		}
-	}, [mergeGraphData]);
+	const reheatLayout = useCallback(() => {
+		wasmSimRef.current?.reheat?.();
+		graphRef.current?.d3ReheatSimulation?.();
+	}, []);
 
-	// Trigger initial API load if localStorage/URL had no saved state
-	useEffect(() => {
-		// eslint-disable-next-line react-hooks/set-state-in-effect
-		if (needsInitialLoad) loadInitialNodes();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, []); // run once on mount; needsInitialLoad is stable from initial state
+	const streamSearchResults = useCallback(
+		(result: { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[]; primaryMatchId?: string; message?: string }, query: string) => {
+			clearSearchStreamTimers();
+			const nodeBatchSize = result.visibleNodes.length > 60 ? 12 : 8;
+			let nodeCursor = 0;
+			let emittedNodeIds = new Set<string>();
+
+			const emitNextBatch = () => {
+				const nextNodes = result.visibleNodes.slice(nodeCursor, nodeCursor + nodeBatchSize);
+				const nextNodeIds = new Set(nextNodes.map((node) => node.id));
+				const cumulativeNodeIds = new Set([...emittedNodeIds, ...nextNodeIds]);
+				const nextLinks = result.visibleLinks.filter((link) => {
+					const source = getEndpointId(link.source);
+					const target = getEndpointId(link.target);
+					return cumulativeNodeIds.has(source) && cumulativeNodeIds.has(target);
+				});
+
+				if (nextNodes.length === 0 && nextLinks.length === 0) return;
+
+				mergeGraphData({ nodes: nextNodes, links: nextLinks });
+				setVisibleNodeIds((prev) => {
+					const next = new Set(prev);
+					for (const id of result.visibleNodeIds) next.add(id);
+					return next;
+				});
+				setStatusMessage(nodeCursor + nextNodes.length >= result.visibleNodes.length ? (result.message ?? `Loaded results for “${query}”.`) : `Streaming results for “${query}”…`);
+				reheatLayout();
+
+				emittedNodeIds = new Set([...emittedNodeIds, ...nextNodeIds]);
+				nodeCursor += nextNodes.length;
+
+				if (nodeCursor < result.visibleNodes.length) {
+					const timeoutId = window.setTimeout(emitNextBatch, 120);
+					searchStreamTimeoutsRef.current.push(timeoutId);
+				}
+			};
+
+			emitNextBatch();
+		},
+		[clearSearchStreamTimers, mergeGraphData, reheatLayout],
+	);
+
+	const persistNodePositions = useCallback(() => {
+		if (typeof window === 'undefined') return;
+		try {
+			const positions: Record<string, { x: number; y: number }> = {};
+			for (const node of visibleGraph.nodes) {
+				if (node.x === undefined || node.y === undefined) continue;
+				positions[node.id] = { x: node.x, y: node.y };
+			}
+			window.localStorage.setItem(
+				NODE_POSITION_STORAGE_KEY,
+				JSON.stringify({ savedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + NODE_POSITION_TTL_MS).toISOString(), positions }),
+			);
+		} catch {}
+	}, [visibleGraph.nodes]);
 
 	// Persist state to localStorage
 	useEffect(() => {
@@ -421,7 +517,6 @@ export default function GraphView() {
 			node.fx = node.x;
 			node.fy = node.y;
 
-			setRecentlyRevealedNodeIds(new Set());
 			setSelectedNodeId(node.id);
 			setVisitedNodeIds((prev) => new Set(prev).add(node.id));
 			setMenuOpen(true);
@@ -434,8 +529,6 @@ export default function GraphView() {
 				revealed.forEach((id) => next.add(id));
 				return next;
 			});
-			setRecentlyRevealedNodeIds(revealed);
-			setTimeout(() => setRecentlyRevealedNodeIds(new Set()), CLICK_REVEAL_HIGHLIGHT_MS);
 		},
 		[dataset, selectedNodeId],
 	);
@@ -458,14 +551,13 @@ export default function GraphView() {
 			const query = searchQuery.trim();
 			if (!query) return;
 			try {
+				clearSearchStreamTimers();
 				const response = await fetch(`/api/graph/search?q=${encodeURIComponent(query)}`);
 				const result = (await response.json()) as { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[]; primaryMatchId?: string };
-				mergeGraphData({ nodes: result.visibleNodes, links: result.visibleLinks });
-				setVisibleNodeIds(new Set(result.visibleNodeIds));
-				if (result.primaryMatchId) setSelectedNodeId(result.primaryMatchId);
+				streamSearchResults(result, query);
 			} catch {}
 		},
-		[mergeGraphData, searchQuery],
+		[clearSearchStreamTimers, searchQuery, streamSearchResults],
 	);
 
 	const lastDragNodeIdRef = useRef<string | null>(null);
@@ -511,23 +603,26 @@ export default function GraphView() {
 		dragChildOffsetsRef.current = [];
 		lastDragNodeIdRef.current = null;
 		wasmSimRef.current?.reheat?.();
-	}, [dataset, selectedNodeId]);
-
-	const handleLoadAllNodes = useCallback(async () => {
-		try {
-			const response = await fetch('/api/graph/search?count=5000');
-			const result = (await response.json()) as { visibleNodes: GraphNode[]; visibleLinks: GraphLink[]; visibleNodeIds: string[] };
-			mergeGraphData({ nodes: result.visibleNodes, links: result.visibleLinks });
-			setVisibleNodeIds(new Set(result.visibleNodeIds));
-		} catch {}
-	}, [mergeGraphData]);
+		persistNodePositions();
+	}, [dataset, persistNodePositions, selectedNodeId]);
 
 	const handleResetSession = useCallback(() => {
 		setVisibleNodeIds(new Set());
 		setSelectedNodeId(null);
 		if (typeof window !== 'undefined') window.localStorage.removeItem(VISIBLE_NODE_IDS_STORAGE_KEY);
+		if (typeof window !== 'undefined') window.localStorage.removeItem(NODE_POSITION_STORAGE_KEY);
 		setSearchQuery('');
 	}, []);
+
+	useEffect(() => {
+		const save = () => persistNodePositions();
+		window.addEventListener('beforeunload', save);
+		window.addEventListener('pagehide', save);
+		return () => {
+			window.removeEventListener('beforeunload', save);
+			window.removeEventListener('pagehide', save);
+		};
+	}, [persistNodePositions]);
 
 	// Step WASM sim each frame and lerp node positions toward sim output.
 	// Mutates node objects in-place — intentional react-force-graph-2d pattern.
@@ -620,13 +715,6 @@ export default function GraphView() {
 								Refresh
 							</button>
 						</div>
-						<button
-							className='mt-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-slate-200'
-							onClick={handleLoadAllNodes}
-							type='button'>
-							Load 5,000 nodes
-						</button>
-
 						<div className='mt-4 flex flex-wrap gap-2'>
 							<button
 								className={`rounded-full px-3 py-1.5 text-xs font-medium ${traceMode ? 'bg-sky-400 text-slate-950' : 'border border-white/10 bg-white/5 text-slate-200'}`}
@@ -760,9 +848,9 @@ export default function GraphView() {
 								const ny = node.y ?? 0;
 								const isInactive = isNodeInactive(node);
 								const isSelected = selectedNodeId === node.id;
-								const isRecently = recentlyRevealedNodeIds.has(node.id);
 								const isHighlighted = highlightedNodeIds.has(node.id);
 								const isHub = node.isHub;
+								const isHubPerson = isHub && node.kind === 'individual';
 
 								// Layer 3: selected/highlighted — glowing halo drawn beneath the node
 								if (isSelected) {
@@ -780,6 +868,23 @@ export default function GraphView() {
 									ctx.strokeStyle = 'rgba(255,255,255,0.45)';
 									ctx.lineWidth = 1.5;
 									ctx.stroke();
+								} else if (isHubPerson) {
+									const orbitR = r + 10;
+									const grad = ctx.createRadialGradient(nx, ny, r * 0.5, nx, ny, orbitR + 10);
+									grad.addColorStop(0, 'rgba(255, 255, 255, 0.18)');
+									grad.addColorStop(0.6, 'rgba(59, 130, 246, 0.10)');
+									grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+									ctx.beginPath();
+									ctx.arc(nx, ny, orbitR + 10, 0, Math.PI * 2);
+									ctx.fillStyle = grad;
+									ctx.fill();
+									ctx.beginPath();
+									ctx.arc(nx, ny, orbitR, 0, Math.PI * 2);
+									ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+									ctx.lineWidth = 1.1;
+									ctx.setLineDash([5, 6]);
+									ctx.stroke();
+									ctx.setLineDash([]);
 								} else if (isHub && !isInactive) {
 									// Layer 2: hub ring
 									ctx.beginPath();
@@ -791,16 +896,27 @@ export default function GraphView() {
 
 								let color: string;
 								if (isSelected) color = dataset.visual.nodeColors[node.kind] ?? dataset.visual.activeNodeColor;
-								else if (isRecently) color = softenHoverColor(dataset.visual.activeLinkColor, 0.3);
 								else if (isHighlighted) color = softenHoverColor(dataset.visual.neighborNodeColor, 0.3);
 								else if (isInactive)
 									color = '#4b5563'; // layer 1 — muted gray
+								else if (isHubPerson)
+									color = '#60a5fa'; // hub person — brighter solar blue
 								else if (isHub)
 									color = '#fbbf24'; // layer 2 hub — amber
 								else color = dataset.visual.nodeColors[node.kind] ?? '#fff';
 
 								const drawFn = node.kind === 'firm' ? drawFirmNode : drawPersonNode;
 								drawFn(ctx, nx, ny, r, color, isInactive, node.hasDisclosure ?? false, 0.96);
+
+								if (isInactive) {
+									ctx.save();
+									ctx.beginPath();
+									ctx.arc(nx, ny, r + 5, 0, Math.PI * 2);
+									ctx.strokeStyle = 'rgba(255,255,255,0.70)';
+									ctx.lineWidth = 1.6;
+									ctx.stroke();
+									ctx.restore();
+								}
 
 								// Labels visible sooner on zoom and kept inside the node silhouette when possible.
 								const minReadableScale = 0.22;
@@ -840,7 +956,7 @@ export default function GraphView() {
 								const r = Math.sqrt((node.size ?? 5) * NODE_REL_SIZE) + 3;
 								ctx.fillStyle = color;
 								ctx.beginPath();
-								ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, Math.PI * 2);
+								ctx.arc(node.x ?? 0, node.y ?? 0, r + 2, 0, Math.PI * 2);
 								ctx.fill();
 							}}
 							nodeLabel='label'
@@ -864,11 +980,11 @@ export default function GraphView() {
 								ctx.lineTo(tx, ty);
 								ctx.lineWidth = isHighlighted ? 1.2 : 0.8;
 								ctx.strokeStyle =
-									isHighlighted ? softenHoverColor('rgba(255,255,255,0.9)', 0.3)
-									: link.relationship === 'employment' ? 'rgba(33,150,243,0.35)'
-									: link.relationship === 'disclosure' ? 'rgba(255,255,255,0.2)'
-									: link.relationship === 'control' ? 'rgba(244,67,54,0.5)'
-									: 'rgba(255,255,255,0.15)';
+									isHighlighted ? 'rgba(255,255,255,1)'
+									: link.relationship === 'employment' ? 'rgba(56,189,248,1)'
+									: link.relationship === 'disclosure' ? 'rgba(148,163,184,1)'
+									: link.relationship === 'control' ? 'rgba(244,67,54,1)'
+									: 'rgba(255,255,255,1)';
 								ctx.stroke();
 								ctx.restore();
 							}}

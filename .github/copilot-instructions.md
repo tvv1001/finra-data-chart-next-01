@@ -8,5 +8,6 @@
 - Prefer typed graph node/link/layout contracts over `any` in the graph pipeline.
 - Use `react-force-graph-2d` for browser-side force-directed animation and keep force tuning data-driven via the shared graph data layer.
 - Prefer interaction patterns that reheat or refocus the simulation instead of hardcoding absolute node coordinates.
+- For the Rust/WASM + graph-rendering workflow, also follow `.github/instructions/web-graph-wasm.instructions.md`.
 - If this repo later grows into a FINRA/SEC data app, keep canonical local data under `web/data/finra/` using normalized file-backed records for people, firms, relationships, and search indexes.
 - If Redis is introduced later, treat it as an optional production-only cache layer; local development and non-prod environments must still boot without Redis.

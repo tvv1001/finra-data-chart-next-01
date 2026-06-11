@@ -136,9 +136,9 @@ export interface SearchRevealResult {
 const INITIAL_FIRM_ID = 'firm-15621';
 
 const DEFAULT_FORCE_CONFIG: ForceLayoutConfig = {
-	scalingRatio: 20,  // strong repulsion → wide spread
-	gravity: 0.25,     // gentle pull to center → nodes don't collapse inward
-	slowDown: 20,      // slow FA2 convergence → fluid drifting motion
+	scalingRatio: 20, // strong repulsion → wide spread
+	gravity: 0.25, // gentle pull to center → nodes don't collapse inward
+	slowDown: 20, // slow FA2 convergence → fluid drifting motion
 	linLogMode: false,
 	outboundAttractionDistribution: false,
 	adjustSizes: true,
@@ -176,6 +176,9 @@ const DEFAULT_VIEWPORT_CONFIG = {
 	fitViewDurationMs: 500,
 	focusDurationMs: 650,
 };
+
+const PERSON_HUB_DEGREE_THRESHOLD = 5;
+const PERSON_SUPER_HUB_DEGREE_THRESHOLD = 10;
 
 const LAST_NAMES = ['Thornton', 'Liu', 'Patel', 'Kim', 'Nguyen', 'Garcia', 'Bennett', 'Rao', 'Chen', 'Walker', 'Collins', 'Young'];
 const FIRST_NAMES = [
@@ -278,6 +281,9 @@ export function createGraphDataset(): GraphDataset {
 
 	for (const node of nodes) {
 		node.degreeHint = degreeCounts.get(node.id) ?? 0;
+		if (node.kind === 'individual') {
+			node.isHub = node.degreeHint >= PERSON_HUB_DEGREE_THRESHOLD;
+		}
 		node.size = getNodeSize(node.degreeHint, node.isHub, node.kind);
 	}
 
@@ -1142,16 +1148,19 @@ function connectEmployment(links: GraphLink[], linkKeys: Set<string>, degreeCoun
 
 function getNodeSize(degreeHint: number, isHub: boolean, kind: GraphNodeKind): number {
 	const connectionCount = Math.max(0, degreeHint);
-	
+
 	if (kind === 'firm') {
 		// Firm sizing (increased by an additional 40%)
 		const degreeScale = Math.pow(connectionCount, 0.35) * 2.35;
 		return 9.45 + degreeScale + (isHub ? 2.35 : 0);
 	}
 
-	// People: larger base size and more aggressive scaling
+	// People: larger base size and more aggressive scaling.
+	// High-connection people become hub-like so they read as a visual center / solar system.
 	const degreeScale = Math.pow(connectionCount, 0.7) * 2.5;
-	return 15 + degreeScale;
+	const hubBoost = isHub ? 5.5 + Math.min(5, Math.max(0, connectionCount - PERSON_HUB_DEGREE_THRESHOLD) * 0.55) : 0;
+	const superHubBoost = connectionCount >= PERSON_SUPER_HUB_DEGREE_THRESHOLD ? 2.5 : 0;
+	return 15 + degreeScale + hubBoost + superHubBoost;
 }
 
 function scoreSearchMatch(haystack: string, needle: string): number {

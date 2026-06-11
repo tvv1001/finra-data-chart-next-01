@@ -10,15 +10,20 @@
 		"lint": "eslint"
 	},
 	"dependencies": {
+		"d3": "^7.9.0",
+		"d3-force": "^3.0.0",
 		"graphology": "^0.25.4",
 		"graphology-layout-forceatlas2": "^0.10.1",
 		"next": "16.2.6",
+		"pixi.js": "^8.19.0",
 		"react": "19.2.4",
 		"react-dom": "19.2.4",
 		"react-force-graph-2d": "^1.29.1"
 	},
 	"devDependencies": {
 		"@tailwindcss/postcss": "^4",
+		"@types/d3": "^7.4.3",
+		"@types/d3-force": "^3.0.10",
 		"@types/node": "^20",
 		"@types/react": "^19",
 		"@types/react-dom": "^19",
